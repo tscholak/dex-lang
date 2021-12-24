@@ -13,44 +13,41 @@
 
   inputs = {
     nixpkgs.follows = "haskell-nix/nixpkgs-unstable";
-    haskell-nix = {
+    haskellNix = {
       url = "github:input-output-hk/haskell.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    utils.follows = "haskell-nix/flake-utils";
+    flake-utils.follows = "haskell-nix/flake-utils";
   };
 
-  outputs = { self, nixpkgs, haskell-nix, utils, ... }:
-    utils.lib.eachSystem [ "x86_64-linux" "x86_64-darwin" ] (system:
+  outputs = { self, nixpkgs, haskellNix, flake-utils, ... }:
+    flake-utils.lib.eachSystem [ "x86_64-linux" "x86_64-darwin" ] (system:
       let
-        pkgs = haskell-nix.legacyPackages.${system};
-        hsPkgs = pkgs.haskellPackages;
-
-        haskellNix = pkgs.haskell-nix.cabalProject {
-          src = pkgs.haskell-nix.haskellLib.cleanGit {
-            name = "dex";
-            src = ./.;
-          };
-          compiler-nix-name = "ghc884";
-        };
-
-        dex = haskellNix.dex.components.exes.dex;
-      in {
-        packages.dex = dex;
-
-        devShell = haskellNix.shellFor {
-          packages = p: [ p.dex ];
-          withHoogle = false;
-          tools = {
-            cabal = "latest";
-            haskell-language-server = "latest";
-          };
-          nativeBuildInputs = [
-            haskellNix.dex.project.roots
-          ];
-          exactDeps = true;
-        };
-
-        defaultPackage = dex;
+        overlays = [
+          haskellNix.overlay
+          (final: prev: { llvm-config = prev.llvm_9; })
+          (final: prev: {
+            dexProject =
+              final.haskell-nix.project' {
+                src = final.haskell-nix.haskellLib.cleanGit {
+                  name = "dex";
+                  src = ./.;
+                };
+                compiler-nix-name = "ghc884";
+                shell.tools = {
+                  cabal = {};
+                  hlint = {};
+                  haskell-language-server = {};
+                };
+                shell.buildInputs = with pkgs; [
+                  nixpkgs-fmt
+                ];
+              };
+          })
+        ];
+        pkgs = import nixpkgs { inherit system overlays; inherit (haskellNix) config; };
+        flake = pkgs.dexProject.flake {};
+      in flake // {
+        defaultPackage = flake.packages."dex:exe:dex";
       });
 }
