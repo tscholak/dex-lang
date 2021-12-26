@@ -12,12 +12,12 @@
   };
 
   inputs = {
-    nixpkgs.follows = "haskell-nix/nixpkgs-unstable";
+    nixpkgs.follows = "haskellNix/nixpkgs-unstable";
     haskellNix = {
       url = "github:input-output-hk/haskell.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    flake-utils.follows = "haskell-nix/flake-utils";
+    flake-utils.follows = "haskellNix/flake-utils";
   };
 
   outputs = { self, nixpkgs, haskellNix, flake-utils, ... }:
@@ -25,10 +25,10 @@
       let
         overlays = [
           haskellNix.overlay
-          (final: prev: { llvm-config = prev.llvm_9; })
           (final: prev: {
+            llvm-config = prev.llvmPackages_9.llvm;
             dexProject =
-              final.haskell-nix.project' {
+              final.haskell-nix.cabalProject' {
                 src = final.haskell-nix.haskellLib.cleanGit {
                   name = "dex";
                   src = ./.;
@@ -39,14 +39,33 @@
                   hlint = {};
                   haskell-language-server = {};
                 };
-                shell.buildInputs = with pkgs; [
+                shell.buildInputs = with final; [
                   nixpkgs-fmt
                 ];
               };
           })
         ];
-        pkgs = import nixpkgs { inherit system overlays; inherit (haskellNix) config; };
-        flake = pkgs.dexProject.flake {};
+        pkgs =
+          let
+            nixpkgsFun = import nixpkgs;
+          in nixpkgsFun {
+            inherit system;
+            inherit (haskellNix) config;
+            overlays = [
+              (final: prev: {
+                pkgsLLVM9 = nixpkgsFun {
+                  inherit system;
+                  inherit (haskellNix) config;
+                  overlays = [
+                    (final': prev': {
+                      stdenv = prev.llvmPackages_9.stdenv;
+                    })
+                  ] ++ overlays;
+                };
+              })
+            ] ++ overlays;
+          };
+        flake = pkgs.pkgsLLVM9.dexProject.flake {};
       in flake // {
         defaultPackage = flake.packages."dex:exe:dex";
       });

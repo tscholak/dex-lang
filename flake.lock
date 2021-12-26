@@ -114,7 +114,7 @@
         "type": "github"
       }
     },
-    "haskell-nix": {
+    "haskellNix": {
       "inputs": {
         "HTTP": "HTTP",
         "cabal-32": "cabal-32",
@@ -264,14 +264,14 @@
     },
     "root": {
       "inputs": {
-        "haskell-nix": "haskell-nix",
-        "nixpkgs": [
-          "haskell-nix",
-          "nixpkgs-unstable"
-        ],
-        "utils": [
-          "haskell-nix",
+        "flake-utils": [
+          "haskellNix",
           "flake-utils"
+        ],
+        "haskellNix": "haskellNix",
+        "nixpkgs": [
+          "haskellNix",
+          "nixpkgs-unstable"
         ]
       }
     },
