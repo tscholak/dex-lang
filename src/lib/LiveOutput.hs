@@ -32,10 +32,10 @@ import Paths_dex  (getDataFileName)
 import Cat
 import Syntax
 import Actor
-import Parser
 import TopLevel
 import RenderHtml
 import PPrint
+import Parser
 
 type NodeId = Int
 data WithId a = WithId { getNodeId :: NodeId
@@ -306,3 +306,21 @@ instance Eq (WithId a) where
 
 instance Ord (WithId a) where
   compare (WithId x _) (WithId y _) = compare x y
+
+-- === some handy monoids ===
+
+data SetVal a = Set a | NotSet
+newtype MonMap k v = MonMap (M.Map k v)  deriving (Show, Eq)
+
+instance Semigroup (SetVal a) where
+  x <> NotSet = x
+  _ <> Set x  = Set x
+
+instance Monoid (SetVal a) where
+  mempty = NotSet
+
+instance (Ord k, Semigroup v) => Semigroup (MonMap k v) where
+  MonMap m <> MonMap m' = MonMap $ M.unionWith (<>) m m'
+
+instance (Ord k, Semigroup v) => Monoid (MonMap k v) where
+  mempty = MonMap mempty

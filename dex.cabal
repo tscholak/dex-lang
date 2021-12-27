@@ -36,10 +36,6 @@ flag llvm-head
 
 flag foreign
   description:         Build the C interface to Dex
-  default:             True
-
-flag safe-names
-  description:         Enables building with safe names checks
   default:             False
 
 library dex-resources
@@ -51,20 +47,12 @@ library dex-resources
   default-extensions:  CPP
 
 library
-  exposed-modules:     Env, Syntax, Type, Inference,
-                       Parser, Util, Imp, Imp.Builder, Imp.Optimize,
-                       PPrint, Algebra, Parallelize, Optimize, Serialize
-                       Builder, Cat,
-                       Simplify, TopLevel,
-                       Autodiff, Interpreter, Logging, CUDA,
-                       LLVM.JIT, LLVM.Shims, JIT, LLVMExec, Export
-                       Err, LabeledItems, SourceRename,
-                       SaferNames.Name, SaferNames.LazyMap,
-                       SaferNames.Syntax, SaferNames.Bridge,
-                       SaferNames.PPrint, SaferNames.Parser,
-                       SaferNames.ResolveImplicitNames, SaferNames.SourceRename,
-                       SaferNames.Type, SaferNames.Builder, SaferNames.Inference,
-                       SaferNames.CheapReduction
+  exposed-modules:     Syntax, Cat, Util, PPrint, Serialize
+                       TopLevel, Interpreter, Logging, CUDA,
+                       LLVM.JIT, LLVM.Shims, JIT, LLVMExec,
+                       Err, LabeledItems, SourceRename, Name, Parser, MTL1,
+                       Type, Builder, Inference, CheapReduction, GenericTraversal,
+                       Simplify, Imp, Algebra
   if flag(live)
     exposed-modules:   Actor, RenderHtml, LiveOutput
   other-modules:       Paths_dex
@@ -82,9 +70,6 @@ library
     build-depends:     warp, wai, blaze-html, http-types, cmark, binary
     cpp-options:       -DDEX_LIVE
     cxx-options:       -DDEX_LIVE
-  if flag(safe-names)
-    cpp-options:       -DDEX_SAFE_NAMES
-    cxx-options:       -DDEX_SAFE_NAMES
   if !os(darwin)
     exposed-modules:   Resources
     hs-source-dirs:    src/resources
@@ -101,7 +86,8 @@ library
                        TupleSections, ScopedTypeVariables, LambdaCase, PatternSynonyms,
                        BlockArguments, GADTs, TypeOperators, DataKinds, KindSignatures
                        ConstraintKinds, FlexibleContexts, RankNTypes, QuantifiedConstraints,
-                       TypeOperators, MultiParamTypeClasses, FunctionalDependencies
+                       TypeOperators, MultiParamTypeClasses, FunctionalDependencies,
+                       GeneralizedNewtypeDeriving
   pkgconfig-depends:   libpng
   if flag(cuda)
     include-dirs:      /usr/local/cuda/include
