@@ -412,7 +412,8 @@ linearizeOp op = case op of
   ThrowException _       -> notImplemented
   SumToVariant _         -> notImplemented
   OutputStreamPtr        -> emitZeroT
-  _ -> notImplemented
+  ProjRef i ref          -> la ref `bindLin` \ref' -> emitOp $ ProjRef i ref'
+  primOp -> error $ "Linearize not implemented for primitive operation " ++ show primOp
   where
     emitZeroT = withZeroT $ liftM Var $ emit =<< substM (Op op)
     la = linearizeAtom
