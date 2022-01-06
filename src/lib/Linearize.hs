@@ -314,13 +314,13 @@ linearizeDecls (Nest (Let b (DeclBinding ann _ expr)) rest) cont = do
 
 linearizeExpr :: Emits o => Expr i -> LinM i o Atom Atom
 linearizeExpr expr = case expr of
-  App x i -> do
+  Atom x -> linearizeAtom x
+  App x idxs -> do
     substM x >>= getType >>= \case
       TabTy _ _ ->
-        zipLin (linearizeAtom x) (pureLin i) `bindLin`
-         \(PairE x' i') -> app x' i'
+        zipLin (linearizeAtom x) (pureLin $ ListE idxs) `bindLin`
+         \(PairE x' (ListE idxs')) -> naryApp x' idxs'
       _ -> error "not implemented"
-  Atom e     -> linearizeAtom e
   Op op      -> linearizeOp op
   Hof e      -> linearizeHof e
   Case e alts resultTy _ -> do
@@ -353,6 +353,7 @@ linearizeOp op = case op of
                 emitOp $ PrimEffect ref' $ MPut x'
   IndexRef ref i -> zipLin (la ref) (pureLin i) `bindLin`
                       \(PairE ref' i') -> emitOp $ IndexRef ref' i'
+  ProjRef i ref -> la ref `bindLin` \ref' -> emitOp $ ProjRef i ref'
   Select p t f -> (pureLin p `zipLin` la t `zipLin` la f) `bindLin`
                      \(p' `PairE` t' `PairE` f') -> emitOp $ Select p' t' f'
   -- XXX: This assumes that pointers are always constants
@@ -361,12 +362,10 @@ linearizeOp op = case op of
   PtrOffset _ _          -> emitZeroT
   IOAlloc _ _            -> emitZeroT
   IOFree _               -> emitZeroT
-  -- TabCon ty xs           -> (TabCon ty <$> traverse la xs) `bindLin` emitOp
   Inject _               -> emitZeroT
   SliceOffset _ _        -> emitZeroT
   SliceCurry  _ _        -> emitZeroT
   VectorBinOp _ _ _      -> notImplemented
-  -- VectorPack  vals       -> (VectorPack  <$> traverse la vals) `bindLin` emitOp
   VectorIndex v i -> zipLin (la v) (pureLin i) `bindLin`
                        \(PairE v' i') -> emitOp $ VectorIndex v' i'
   UnsafeFromOrdinal _ _  -> emitZeroT
@@ -375,6 +374,13 @@ linearizeOp op = case op of
   ThrowError _           -> emitZeroT
   DataConTag _           -> emitZeroT
   ToEnum _ _             -> emitZeroT
+  TabCon ty xs -> do
+    ty' <- substM ty
+    seqLin (map linearizeAtom xs) `bindLin` \(ComposeE xs') ->
+      emitOp $ TabCon (sink ty') xs'
+  VectorPack xs ->
+    seqLin (map linearizeAtom xs) `bindLin` \(ComposeE xs') ->
+      emitOp $ VectorPack xs'
   CastOp t v             -> do
     vt <- getType =<< substM v
     t' <- substM t

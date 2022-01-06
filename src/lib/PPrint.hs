@@ -119,9 +119,8 @@ instance PrettyE ann => Pretty (BinderP c ann n l)
 
 instance Pretty (Expr n) where pretty = prettyFromPrettyPrec
 instance PrettyPrec (Expr n) where
-  prettyPrec (App f x) =
-    atPrec AppPrec $ pApp f <+> pArg x
   prettyPrec (Atom x ) = prettyPrec x
+  prettyPrec (App f xs) = atPrec AppPrec $ pApp f <+> spaced xs
   prettyPrec (Op  op ) = prettyPrec op
   prettyPrec (Hof (For ann (Lam lamExpr))) =
     atPrec LowestPrec $ forStr ann <+> prettyLamHelper lamExpr (PrettyFor ann)
@@ -518,8 +517,8 @@ instance Pretty (UAlt n) where
 instance Pretty (UDecl n l) where
   pretty (ULet ann b rhs) =
     align $ p ann <+> p b <+> "=" <> (nest 2 $ group $ line <> pLowest rhs)
-  pretty (UDataDefDecl (UDataDef bParams dataCons) bTyCon bDataCons) =
-    "data" <+> p bTyCon <+> p bParams
+  pretty (UDataDefDecl (UDataDef bParams bIfaces dataCons) bTyCon bDataCons) =
+    "data" <+> p bTyCon <+> p bParams <+> (brackets $ p bIfaces)
        <+> "where" <> nest 2
        (hardline <> prettyLines (zip (toList $ fromNest bDataCons) dataCons))
   pretty (UInterface params superclasses methodTys interfaceName methodNames) =
