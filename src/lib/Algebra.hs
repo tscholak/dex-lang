@@ -11,25 +11,26 @@
 module Algebra (
   Polynomial, ClampPolynomial, PolyName, emitCPoly,
   emptyMonomial, poly, mono, liftC, sumC, psubst,
-  liftPoly, indexSetSizeCPoly, showPoly, showPolyC) where
+  liftPoly, showPoly, showPolyC, blockAsCPoly) where
 
 import Prelude hiding (lookup, sum, pi)
 import Control.Monad
 import Data.Functor
-import qualified Data.Foldable as F
 import Data.Ratio
-import Data.Map.Strict hiding (foldl, map)
+import Control.Applicative
+import Data.Map.Strict hiding (foldl, map, empty, (!))
 import Data.Text.Prettyprint.Doc
 import Data.List (intersperse)
 import Data.Tuple (swap)
 import Data.Coerce
 
 import Builder hiding (sub, add)
-import LabeledItems
+import Simplify
 import Syntax
 import Type
 import Name
 import Err
+import MTL1
 
 type PolyName = Name AtomNameC
 type PolyBinder = NameBinder AtomNameC
@@ -141,12 +142,6 @@ cpoly cmonos = Polynomial $ fromListWith (+) $ fmap swap cmonos
 cmono :: [Clamp n] -> Monomial n -> ClampMonomial n
 cmono = ClampMonomial
 
-onePoly :: Polynomial n
-onePoly = poly [(1, mono [])]
-
-zeroPoly :: Polynomial n
-zeroPoly = poly []
-
 -- === Type classes and helpers ===
 
 showMono :: Monomial n -> String
@@ -181,72 +176,94 @@ liftPoly m = Polynomial $ singleton m (fromInteger 1)
 liftC :: Polynomial n -> ClampPolynomial n
 liftC = imapMonos $ cmono []
 
+fromC :: ClampPolynomial n -> Maybe (Polynomial n)
+fromC cp =
+  fmap (Polynomial . fromList) $ forM cmonos \case
+    (ClampMonomial [] m, coef) -> Just (m, coef)
+    _ -> Nothing
+  where cmonos = toList $ fromPolynomial cp
+
 clamp :: Polynomial n -> ClampPolynomial n
 clamp p = cpoly [(1, cmono [Clamp p] (mono []))]
 
--- === index set size as a clamped polymonial ===
+-- === core expressions as polynomials ===
 
--- TODO: figure out what to do here when we make index sets a user-definable
--- thing
-indexSetSizeCPoly :: EnvReader m => Type n -> m n (ClampPolynomial n)
-indexSetSizeCPoly (TC con) = case con of
-  ProdType tys -> do
-    sizes <- mapM indexSetSizeCPoly (F.toList tys)
-    return $ foldl mulC (liftC onePoly) sizes
-  IntRange low high     -> do
-    low'  <- toPolynomial low
-    high' <- toPolynomial high
-    return $ clamp $ high' `sub` low'
-  IndexRange n low high -> case (low, high) of
-    -- When one bound is left unspecified, the size expressions are guaranteed
-    -- to be non-negative, so we don't have to clamp them.
-    (Unlimited, _) -> liftC <$> mkHigh -- `sub` 0
-    (_, Unlimited) -> do
-      n' <- indexSetSizeCPoly n
-      low' <- liftC <$> mkLow
-      return $ n' `sub` low'
-    -- When both bounds are specified, we may have to clamp to avoid negative terms
-    _ -> do
-      high' <- mkHigh
-      low'  <- mkLow
-      return $ clamp $ high' `sub` low'
-    where
-      add1 = add (poly [(1, mono [])])
-      -- The unlimited cases should have been handled above
-      mkLow = case low of
-        InclusiveLim l -> toPolynomial l
-        ExclusiveLim l -> add1 <$> toPolynomial l
-        Unlimited      -> error "unreachable"
-      mkHigh = case high of
-        InclusiveLim h -> add1 <$> toPolynomial h
-        ExclusiveLim h -> toPolynomial h
-        Unlimited      -> error "unreachable"
-  _ -> error $ "Not implemented " ++ pprint con
-indexSetSizeCPoly (RecordTy (NoExt types)) = do
-  sizes <- mapM indexSetSizeCPoly (F.toList types)
-  return $ foldl mulC (liftC onePoly) sizes
-indexSetSizeCPoly (VariantTy (NoExt types)) = do
-  sizes <- mapM indexSetSizeCPoly (F.toList types)
-  return $ foldl add (liftC zeroPoly) sizes
-indexSetSizeCPoly ty = error $ "Not implemented " ++ pprint ty
+type CPolySubstVal = SubstVal AtomNameC (MaybeE ClampPolynomial)
 
-toPolynomial :: EnvReader m => Atom n -> m n (Polynomial n)
-toPolynomial atom = case atom of
-  -- XXX: here, we expect the type of `v` to be either `IdxRepTy` or
-  -- an index set. But we should check it.
-  Var v -> return $ poly [(1, mono [(v, 1)])]
-  IdxRepVal x -> return $ fromInt x
-  Con (IntRangeVal _ _ i) -> toPolynomial i
-  Con (IndexRangeVal _ _ _ i) -> toPolynomial i
-  -- TODO: Coercions? Unit constructor?
-  _ -> unreachable
+blockAsCPoly :: (EnvExtender m, EnvReader m) => Block n -> m n (Maybe (ClampPolynomial n))
+blockAsCPoly (Block _ decls' result') =
+  runMaybeT1 $ runSubstReaderT idSubst $ go $ Abs decls' result'
   where
-    fromInt i = poly [((fromIntegral i) % 1, mono [])]
-    unreachable = error $ "Unsupported or invalid atom in index set: " ++ pprint atom
+    go :: (EnvExtender2 m, EnvReader2 m, SubstReader CPolySubstVal m, Alternative2 m)
+       => Abs (Nest Decl) Expr o -> m o o (ClampPolynomial o)
+    go (Abs decls result) = case decls of
+      Empty -> exprAsCPoly result
+      Nest decl@(Let _ (DeclBinding _ _ expr)) restDecls -> do
+        let rest = Abs restDecls result
+        cp <- toMaybeE <$> optional (exprAsCPoly expr)
+        refreshAbs (Abs decl rest) \(Let b _) rest' -> do
+          extendSubst (b@>SubstVal (sink cp)) $ do
+            cpresult <- go rest'
+            case hoist b cpresult of
+              HoistSuccess ans -> return ans
+              HoistFailure _   -> empty
+
+    exprAsCPoly :: (EnvReader2 m, SubstReader CPolySubstVal m, Alternative2 m) => Expr o -> m o o (ClampPolynomial o)
+    exprAsCPoly e = case e of
+      Atom a                    -> intAsCPoly a
+      Op (ToOrdinal ix)         -> indexAsCPoly ix
+      Op (ScalarBinOp IAdd x y) -> add  <$> intAsCPoly x <*> intAsCPoly y
+      Op (ScalarBinOp ISub x y) -> sub  <$> intAsCPoly x <*> intAsCPoly y
+      Op (ScalarBinOp IMul x y) -> mulC <$> intAsCPoly x <*> intAsCPoly y
+      -- TODO: Remove once IntRange and IndexRange are defined in the surface language
+      Op (CastOp IdxRepTy v)    -> getType v >>= \case
+        IdxRepTy -> intAsCPoly v
+        _        -> indexAsCPoly v
+      -- This looks for `select c 0 n` such that `c` is defined as `n < 0`.
+      Op (Select (Var c) t f) -> do
+        lookupAtomName c >>= \case
+          LetBound (DeclBinding _ _ expr) -> case (expr, t, f) of
+            (Op (ScalarBinOp (ICmp Less) (Var v) (IdxRepVal 0)), IdxRepVal 0, Var v') | v == v' -> do
+              vp <- intAsCPoly (Var v)
+              case fromC vp of
+                Just p  -> return $ clamp p
+                Nothing -> empty
+            _ -> empty
+          _ -> empty
+      _ -> empty
+
+    -- We identify index typed values as their ordinals. This assumes that all
+    -- index vars appearing in the size expressions will come from dependent
+    -- dimensions, so that summing over those dims will erase those vars from
+    -- polynomials.
+    indexAsCPoly :: (SubstReader CPolySubstVal m, Alternative2 m)
+                 => Atom i -> m i o (ClampPolynomial o)
+    indexAsCPoly = \case
+      Var v                       -> varAsCPoly v
+      Con (IntRangeVal _ _ i)     -> intAsCPoly i
+      Con (IndexRangeVal _ _ _ i) -> intAsCPoly i
+      _                           -> empty
+
+    intAsCPoly :: (SubstReader CPolySubstVal m, Alternative2 m)
+                => Atom i -> m i o (ClampPolynomial o)
+    intAsCPoly = \case
+      Var v       -> varAsCPoly v
+      IdxRepVal x -> return $ fromInt x
+      _ -> empty
+      where fromInt i = liftC $ poly [((fromIntegral i) % 1, mono [])]
+
+    varAsCPoly :: (SubstReader CPolySubstVal m, Alternative2 m)
+               => AtomName i -> m i o (ClampPolynomial o)
+    varAsCPoly v = getSubst <&> (!v) >>= \case
+      SubstVal NothingE   -> empty
+      SubstVal (JustE cp) -> return cp
+      SubstVal _          -> error "impossible"
+      Rename   v'         -> return $ liftC $ poly [(1, mono [(v', 1)])]
 
 -- === polynomials to Core expressions ===
 
-emitCPoly :: (Emits n, Builder m) => ClampPolynomial n -> m n (Atom n)
+emitCPoly :: (Emits n, Builder m, MonadIxCache1 m)
+          => ClampPolynomial n -> m n (Atom n)
 emitCPoly = emitPolynomialP emitClampMonomial
 
 -- We have to be extra careful here, because we're evaluating a polynomial
@@ -269,14 +286,14 @@ emitPolynomialP evalMono (Polynomial p) = do
     --       because it might be causing overflows due to all arithmetic being shifted.
     asAtom = IdxRepVal . fromInteger
 
-emitClampMonomial :: (Emits n, Builder m) => ClampMonomial n -> m n (Atom n)
+emitClampMonomial :: (Emits n, Builder m, MonadIxCache1 m) => ClampMonomial n -> m n (Atom n)
 emitClampMonomial (ClampMonomial clamps m) = do
   valuesToClamp <- traverse (emitPolynomialP emitMonomial . coerce) clamps
   clampsProduct <- foldM imul (IdxRepVal 1) =<< traverse clampPositive valuesToClamp
   mval <- emitMonomial m
   imul clampsProduct mval
 
-emitMonomial :: (Emits n, Builder m) => Monomial n -> m n (Atom n)
+emitMonomial :: (Emits n, Builder m, MonadIxCache1 m) => Monomial n -> m n (Atom n)
 emitMonomial (Monomial m) = do
   varAtoms <- forM (toList m) \(v, e) -> do
     v' <- emitPolyName v
@@ -291,11 +308,11 @@ ipow x i = foldM imul (IdxRepVal 1) (replicate i x)
 -- the purposes of doing polynomial manipulation. But when we eventually emit
 -- them into a realy dex program we need to the conversion-to-ordinal
 -- explicitly.
-emitPolyName :: (Emits n, Builder m) => PolyName n -> m n (Atom n)
+emitPolyName :: (Emits n, Builder m, MonadIxCache1 m) => PolyName n -> m n (Atom n)
 emitPolyName v = do
   getType (Var v) >>= \case
     IdxRepTy -> return $ Var v
-    _ -> indexToInt $ Var v
+    ty -> appSimplifiedIxMethod ty simpleToOrdinal (Var v)
 
 -- === instances ===
 

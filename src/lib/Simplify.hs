@@ -8,25 +8,31 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Simplify
-  ( simplifyModule, splitSimpModule, applyDataResults
-  , simplifyBlock, liftSimplifyM) where
+module Simplify ( simplifyTopBlock, simplifyTopFunction, SimplifiedBlock (..)
+                , simplifyBlock, liftSimplifyM, buildBlockSimplified
+                , IxCache, MonadIxCache1, SimpleIxInstance (..)
+                , simplifiedIxInstance, appSimplifiedIxMethod ) where
 
 import Control.Category ((>>>))
 import Control.Monad
 import Control.Monad.Reader
+import Control.Monad.State.Class
 import Data.Foldable (toList)
+import Data.Text.Prettyprint.Doc (Pretty (..), hardline)
 import qualified Data.Map.Strict as M
+import qualified Data.HashMap.Strict as HM
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Set as S
 
 import Err
 
 import Name
+import MTL1
 import Builder
 import Syntax
 import Type
 import Util (enumerate)
+import CheapReduction
 import Linearize
 import Transpose
 import LabeledItems
@@ -41,21 +47,18 @@ newtype SimplifyM (i::S) (o::S) (a:: *) = SimplifyM
   deriving ( Functor, Applicative, Monad, ScopeReader, EnvExtender
            , Builder, EnvReader, SubstReader AtomSubstVal, MonadFail)
 
-runSimplifyM :: Distinct n => Env n -> SimplifyM n n (e n) -> e n
-runSimplifyM bindings cont =
-  withImmutEvidence (toImmutEvidence bindings) $
-    runHardFail $
-      runBuilderT bindings $
-        runSubstReaderT idSubst $
-          runSimplifyM' cont
+liftSimplifyM :: (SinkableE e, EnvReader m) => SimplifyM n n (e n) -> m n (e n)
+liftSimplifyM cont = do
+  liftBuilder $ runSubstReaderT idSubst $ runSimplifyM' cont
 
-liftSimplifyM
-  :: (EnvReader m, SinkableE e)
-  => (forall l. (Immut l, DExt n l) => SimplifyM l l (e l))
-  -> m n (e n)
-liftSimplifyM cont = liftImmut do
-  DB env <- getDB
-  return $ runSimplifyM env $ cont
+buildBlockSimplified
+  :: (Builder m)
+  => (forall l. (Emits l, DExt n l) => BuilderM l (Atom l))
+  -> m n (Block n)
+buildBlockSimplified m =
+  liftSimplifyM do
+    block <- liftBuilder $ buildBlock m
+    buildBlock $ simplifyBlock block
 
 instance Simplifier SimplifyM
 
@@ -68,37 +71,37 @@ instance ScopableBuilder (SimplifyM i) where
   buildScoped cont = SimplifyM $ SubstReaderT $ ReaderT \env ->
     buildScoped $ runSubstReaderT (sink env) (runSimplifyM' cont)
 
--- === Top level ===
+-- === Top-level API ===
 
-simplifyModule :: Distinct n => Env n -> Module n -> Module n
-simplifyModule env (Module Core decls result) = runSimplifyM env do
-  Immut <- return $ toImmutEvidence env
-  DistinctAbs decls' result' <-
-    buildScoped $ simplifyDecls decls $
-      substEvaluatedModuleM result
-  return $ Module Simp decls' result'
-simplifyModule _ (Module ir _ _) = error $ "Expected Core, got: " ++ show ir
+data SimplifiedBlock n = SimplifiedBlock (Block n) (ReconstructAtom n)
 
-type AbsEvaluatedModule n = Abs (Nest (NameBinder AtomNameC)) EvaluatedModule n
+-- TODO: extend this to work on functions instead of blocks (with blocks still
+-- accessible as nullary functions)
+simplifyTopBlock :: EnvReader m => Block n -> m n (SimplifiedBlock n)
+simplifyTopBlock block = liftSimplifyM do
+  (Abs UnitB block', recon) <- simplifyAbs $ Abs UnitB block
+  return $ SimplifiedBlock block' recon
 
-splitSimpModule :: forall n. Distinct n
-                 => Env n -> Module n
-                -> (Block n , AbsEvaluatedModule n)
-splitSimpModule env (Module _ decls result) = do
-  runEnvReaderM env $ runSubstReaderT idNameSubst do
-    Immut <- return $ toImmutEvidence env
-    substBinders decls \decls' -> do
-      result' <- substM result
-      telescopicCaptureBlock decls' $ result'
+simplifyTopFunction :: EnvReader m => NaryPiType n -> Atom n -> m n (NaryLamExpr n)
+simplifyTopFunction ty f = liftSimplifyM do
+  buildNaryLamExpr ty \xs -> do
+    dropSubst $ simplifyExpr $ App (sink f) $ fmap Var xs
 
-applyDataResults :: EnvReader m
-                 => AbsEvaluatedModule n -> Atom n
-                 -> m n (EvaluatedModule n)
-applyDataResults (Abs bs evaluated) x = do
-  runSubstReaderT idSubst do
-    xs <- liftM ignoreExcept $ runFallibleT1 $ unpackTelescope x
-    extendSubst (bs @@> map SubstVal xs) $
-      substEvaluatedModuleM evaluated
+instance GenericE SimplifiedBlock where
+  type RepE SimplifiedBlock = PairE Block ReconstructAtom
+  fromE (SimplifiedBlock block recon) = PairE block recon
+  toE   (PairE block recon) = SimplifiedBlock block recon
+
+instance SinkableE SimplifiedBlock
+instance SubstE Name SimplifiedBlock
+instance CheckableE SimplifiedBlock where
+  checkE (SimplifiedBlock block recon) =
+    -- TODO: CheckableE instance for the recon too
+    SimplifiedBlock <$> checkE block <*> substM recon
+
+instance Pretty (SimplifiedBlock n) where
+  pretty (SimplifiedBlock block recon) =
+    pretty block <> hardline <> pretty recon
 
 -- === All the bits of IR  ===
 
@@ -121,11 +124,11 @@ _simplifyStandalone block =
 
 simplifyExpr :: (Emits o, Simplifier m) => Expr i -> m i o (Atom o)
 simplifyExpr expr = case expr of
-  Atom x -> simplifyAtom x
   App f xs -> do
     xs' <- mapM simplifyAtom xs
     f' <- simplifyAtom f
     simplifyApp f' xs'
+  Atom x -> simplifyAtom x
   Op  op  -> mapM simplifyAtom op >>= simplifyOp
   Hof hof -> simplifyHof hof
   Case e alts resultTy eff -> do
@@ -166,7 +169,7 @@ defuncCase scrut alts resultTy = do
   fromSplit split dataVal nonDataVal
   where
     getAltNonDataTy :: EnvReader m => Alt n -> m n (Type n)
-    getAltNonDataTy (Abs bs body) = liftImmut $ liftSubstEnvReaderM do
+    getAltNonDataTy (Abs bs body) = liftSubstEnvReaderM do
       substBinders bs \bs' -> do
         ~(PairTy _ ty) <- getTypeSubst body
         -- Result types of simplified abs should be hoistable past binder
@@ -174,7 +177,7 @@ defuncCase scrut alts resultTy = do
 
     injectAltResult :: EnvReader m => Type n -> Int -> Alt n -> m n (Alt n)
     injectAltResult sumTy con (Abs bs body) = liftBuilder do
-      buildAlt (sink $ EmptyAbs bs) \vs -> do
+      buildAlt (EmptyAbs bs) \vs -> do
         originalResult <- emitBlock =<< applySubst (bs@@>vs) body
         (dataResult, nonDataResult) <- fromPair originalResult
         return $ PairVal dataResult $ Con $ SumCon (sink sumTy) con nonDataResult
@@ -183,13 +186,12 @@ defuncCase scrut alts resultTy = do
     -- first component is data. The reconstruction returned only applies to the
     -- second component.
     simplifyAlt
-      :: (Simplifier m, BindsEnv b, SubstB AtomSubstVal b)
+      :: (Simplifier m, BindsEnv b, SubstB Name b, SubstB AtomSubstVal b)
       => SplitDataNonData n -> Abs b Block i -> m i o (Abs b Block o, ReconstructAtom o)
-    simplifyAlt split (Abs bs body) = fromPairE <$> liftImmut do
+    simplifyAlt split (Abs bs body) = fromPairE <$> do
       substBinders bs \bs' -> do
-        DistinctAbs decls result <- buildScoped $ simplifyBlock body
-        -- TODO: this would be more efficient if we had the two-computation version of buildScoped
-        extendEnv (toEnvFrag decls) do
+        ab <- buildScoped $ simplifyBlock body
+        refreshAbs ab \decls result -> do
           let locals = toScopeFrag bs' >>> toScopeFrag decls
           -- TODO: this might be too cautious. The type only needs to be hoistable
           -- above the decls. In principle it can still mention vars from the lambda
@@ -203,22 +205,24 @@ defuncCase scrut alts resultTy = do
                             (Atom (PairVal resultData newResult))
           return $ PairE (Abs bs' block) (LamRecon reconAbs)
 
-simplifyApp :: (Emits o, Simplifier m) => Atom o -> [Atom o] -> m i o (Atom o)
-simplifyApp f [] = return f
-simplifyApp f xs@(x:rest) = case f of
+simplifyApp :: (Emits o, Simplifier m) => Atom o -> NonEmpty (Atom o) -> m i o (Atom o)
+simplifyApp f xs = case f of
   Lam (LamExpr b body) -> do
-    ans <- dropSubst $ extendSubst (b@>SubstVal x) $ simplifyBlock body
-    simplifyApp ans rest
+    let x:|rest = xs
+    case nonEmpty rest of
+      Nothing -> dropSubst $ extendSubst (b@>SubstVal x) $ simplifyBlock body
+      Just rest' -> do
+       ans <- dropSubst $ extendSubst (b@>SubstVal x) $ simplifyBlock body
+       simplifyApp ans rest'
   ACase e alts ty -> do
-    Just (NaryPiType piBinders _ resultTy) <- return $ fromNaryPiType (length xs) ty
-    resultTy' <- applySubst (piBinders @@> map SubstVal xs) resultTy
+    resultTy <- getAppType ty $ toList xs
     alts' <- forM alts \(Abs bs a) -> do
       buildAlt (EmptyAbs bs) \vs -> do
         a' <- applySubst (bs@@>vs) a
-        naryApp a' (map sink xs)
+        naryApp a' (map sink $ toList xs)
     eff <- getAllowedEffects -- TODO: more precise effects
-    dropSubst $ simplifyExpr $ Case e alts' resultTy' eff
-  _ -> naryApp f xs
+    dropSubst $ simplifyExpr $ Case e alts' resultTy eff
+  _ -> naryApp f $ toList xs
 
 simplifyAtom :: Simplifier m => Atom i -> m i o (Atom o)
 simplifyAtom atom = case atom of
@@ -245,13 +249,20 @@ simplifyAtom atom = case atom of
     DataCon name <$> substM def <*> mapM simplifyAtom params
                  <*> pure con <*> mapM simplifyAtom args
   Record items -> Record <$> mapM simplifyAtom items
-  RecordTy items -> RecordTy <$> simplifyExtLabeledItems items
+  RecordTy _ -> substM atom >>= cheapNormalize >>= \atom' -> case atom' of
+    StaticRecordTy items -> StaticRecordTy <$> dropSubst (mapM simplifyAtom items)
+    _ -> error $ "Failed to simplify a record with a dynamic label: " ++ pprint atom'
   Variant types label i value -> do
     types' <- fromExtLabeledItemsE <$> substM (ExtLabeledItemsE types)
     value' <- simplifyAtom value
     return $ Variant types' label i value'
   VariantTy items -> VariantTy <$> simplifyExtLabeledItems items
-  LabeledRow items -> LabeledRow <$> simplifyExtLabeledItems items
+  LabeledRow elems -> substM elems >>= \elems' -> case fromFieldRowElems elems' of
+    [StaticFields items] -> do
+      items' <- dropSubst $ mapM simplifyAtom items
+      return $ LabeledRow $ fieldRowElemsFromList [StaticFields items']
+    []                   -> return $ LabeledRow $ fieldRowElemsFromList []
+    _ -> error "Failed to simplify a labeled row"
   ACase e alts rTy   -> do
     e' <- simplifyAtom e
     case trySelectBranch e' of
@@ -288,8 +299,7 @@ simplifyVar v = do
     Rename v' -> do
       AtomNameBinding bindingInfo <- lookupEnv v'
       case bindingInfo of
-        LetBound (DeclBinding ann _ (Atom x))
-          | ann /= NoInlineLet -> dropSubst $ simplifyAtom x
+        LetBound (DeclBinding _ _ (Atom x)) -> dropSubst $ simplifyAtom x
         _ -> return $ Var v'
 
 simplifyLam :: (Simplifier m) => Atom i -> m i o (Atom o, ReconstructAtom o)
@@ -342,15 +352,13 @@ splitDataComponents = \case
       , fromSplit = \_ x -> return x }
 
 simplifyAbs
-  :: (Simplifier m, BindsEnv b, SubstB AtomSubstVal b)
+  :: (Simplifier m, BindsEnv b, SubstB Name b, SubstB AtomSubstVal b)
   => Abs b Block i -> m i o (Abs b Block o, ReconstructAtom o)
-simplifyAbs (Abs bs body) = fromPairE <$> liftImmut do
+simplifyAbs (Abs bs body) = fromPairE <$> do
   substBinders bs \bs' -> do
-    DistinctAbs decls result <- buildScoped $ simplifyBlock body
-    -- TODO: this would be more efficient if we had the two-computation version of buildScoped
-    extendEnv (toEnvFrag decls) do
-      resultTy <- getType result
-      isData resultTy >>= \case
+    ab <- buildScoped $ simplifyBlock body
+    refreshAbs ab \decls result -> do
+      getType result >>= isData >>= \case
         True -> do
           block <- makeBlock decls $ Atom result
           return $ PairE (Abs bs' block) IdentityRecon
@@ -366,26 +374,41 @@ simplifyAbs (Abs bs body) = fromPairE <$> liftImmut do
 -- TODO: come up with a coherent strategy for ordering these various reductions
 simplifyOp :: (Emits o, Simplifier m) => Op o -> m i o (Atom o)
 simplifyOp op = case op of
-  RecordCons left right ->
-    getType right >>= \case
-      RecordTy (NoExt rightTys) -> do
+  RecordCons left right -> getType left >>= \case
+    StaticRecordTy leftTys -> getType right >>= \case
+      StaticRecordTy rightTys -> do
         -- Unpack, then repack with new arguments (possibly in the middle).
+        leftList <- getUnpacked left
+        let leftItems = restructure leftList leftTys
         rightList <- getUnpacked right
         let rightItems = restructure rightList rightTys
-        return $ Record $ left <> rightItems
+        return $ Record $ leftItems <> rightItems
       _ -> error "not a record"
-  RecordSplit (LabeledItems litems) full ->
-    getType full >>= \case
-      RecordTy (NoExt fullTys) -> do
+    _ -> error "not a record"
+  RecordConsDynamic (Con (LabelCon l)) val rec ->
+    getType rec >>= \case
+      StaticRecordTy itemTys -> do
+        itemList <- getUnpacked rec
+        let items = restructure itemList itemTys
+        return $ Record $ labeledSingleton l val <> items
+      _ -> error "not a record"
+  RecordSplit f full -> getType full >>= \case
+    StaticRecordTy fullTys -> case f of
+      LabeledRow f' | [StaticFields fields] <- fromFieldRowElems f' -> do
         -- Unpack, then repack into two pieces.
         fullList <- getUnpacked full
-        let LabeledItems fullItems = restructure fullList fullTys
-            splitLeft fvs ltys = NE.fromList $ NE.take (length ltys) fvs
-            left = M.intersectionWith splitLeft fullItems litems
-            splitRight fvs ltys = NE.nonEmpty $ NE.drop (length ltys) fvs
-            right = M.differenceWith splitRight fullItems litems
-        return $ Record $ Unlabeled $
-          [Record (LabeledItems left), Record (LabeledItems right)]
+        let fullItems = restructure fullList fullTys
+        let (left, right) = splitLabeledItems fields fullItems
+        return $ Record $ Unlabeled [Record left, Record right]
+      _ -> error "failed to simplifiy a field row"
+    _ -> error "not a record"
+  RecordSplitDynamic (Con (LabelCon l)) rec ->
+    getType rec >>= \case
+      StaticRecordTy itemTys -> do
+        itemList <- getUnpacked rec
+        let items = restructure itemList itemTys
+        let (val, rest) = splitLabeledItems (labeledSingleton l ()) items
+        return $ PairVal (head $ toList val) $ Record rest
       _ -> error "not a record"
   VariantLift leftTys@(LabeledItems litems) right -> getType right >>= \case
     VariantTy (NoExt rightTys) -> do
@@ -557,3 +580,75 @@ hasExceptions expr = do
   case t of
     Nothing -> return $ ExceptionEffect `S.member` effs
     Just _  -> error "Shouldn't have tail left"
+
+-- === Ix simplification ===
+
+data SimpleIxInstance (n::S) =
+  SimpleIxInstance
+    { simpleIxSize            :: (Abs (Nest Decl) LamExpr n)
+    , simpleToOrdinal         :: (Abs (Nest Decl) LamExpr n)
+    , simpleUnsafeFromOrdinal :: (Abs (Nest Decl) LamExpr n)
+    }
+
+instance GenericE SimpleIxInstance where
+  type RepE SimpleIxInstance = (PairE (Abs (Nest Decl) LamExpr)
+                                 (PairE (Abs (Nest Decl) LamExpr)
+                                        (Abs (Nest Decl) LamExpr)))
+  fromE (SimpleIxInstance a b c) = PairE a (PairE b c)
+  toE (PairE a (PairE b c)) = SimpleIxInstance a b c
+
+instance SubstE Name SimpleIxInstance
+instance SinkableE SimpleIxInstance
+instance HoistableE SimpleIxInstance
+
+type IxCache = HashMapE (EKey Type) SimpleIxInstance
+
+type MonadIxCache1 (m::MonadKind1) = forall n. MonadState (IxCache n) (m n)
+
+instance Monad1 m => HoistableState IxCache m where
+  -- TODO: I think we can do hoisting only based on the free vars in keys.
+  -- Instances should only be added at the top-level so it's not like they
+  -- can refer to any local vars that could prevent the values from being hoistable.
+  hoistState s b s' = case hoist b s' of
+    HoistSuccess s'' -> return s''
+    HoistFailure _   -> return s
+
+simplifiedIxInstance
+  :: (EnvReader m, MonadIxCache1 m)
+  => Type n -> m n (SimpleIxInstance n)
+simplifiedIxInstance ty = do
+  let key = EKey ty
+  gets (HM.lookup key . fromHashMapE) >>= \case
+    Just a -> return a
+    Nothing -> do
+      a <- simplifyInstance
+      modify (<> (HashMapE $ HM.singleton key a))
+      return a
+  where
+    simplifyInstance = liftSimplifyM do
+      Block _ decls expr <- liftBuilder $ buildBlock $ do
+        impl <- getIxImpl $ sink ty
+        return $ ProdVal [ixSize impl, toOrdinal impl, unsafeFromOrdinal impl]
+      simpBlock <- buildBlock $ simplifyDecls decls $
+        simplifyExpr expr >>= \case
+          ProdVal [size, toOrd, fromOrd] -> dropSubst do
+            (size'   , IdentityRecon) <- simplifyLam size
+            (toOrd'  , IdentityRecon) <- simplifyLam toOrd
+            (fromOrd', IdentityRecon) <- simplifyLam fromOrd
+            return $ ProdVal [size', toOrd', fromOrd']
+          _ -> error "Failed to simplify Ix methods"
+      case simpBlock of
+        Block _ simpDecls (Atom (ProdVal [Lam size, Lam toOrd, Lam fromOrd])) -> do
+          return $ SimpleIxInstance (Abs simpDecls size) (Abs simpDecls toOrd) (Abs simpDecls fromOrd)
+        _ -> error "Failed to simplify Ix methods"
+
+appSimplifiedIxMethod
+  :: (Emits n, Builder m, MonadIxCache1 m)
+  => Type n -> (SimpleIxInstance n -> Abs (Nest Decl) LamExpr n)
+  -> Atom n -> m n (Atom n)
+appSimplifiedIxMethod ty method x = do
+  Abs decls f <- method <$> simplifiedIxInstance ty
+  f' <- emitDecls decls f
+  Distinct <- getDistinct
+  case f' of
+    LamExpr fx' fb' -> emitBlock =<< applySubst (fx' @> SubstVal x) fb'

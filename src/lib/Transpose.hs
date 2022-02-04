@@ -23,17 +23,16 @@ import Util (zipWithT, enumerate)
 import GHC.Stack
 
 transpose :: (MonadFail1 m, EnvReader m) => Atom n -> m n (Atom n)
-transpose lam@(Lam (LamExpr b body)) = liftImmut do
-  DB env <- getDB
-  Pi (PiType piBinder _ resultTy) <- getType lam
+transpose lam = liftBuilder do
+  lam'@(Lam (LamExpr b body)) <- sinkM lam
+  Pi (PiType piBinder _ resultTy) <- getType lam'
   let argTy = binderType b
   let resultTy' = ignoreHoistFailure $ hoist piBinder resultTy
-  return $ runBuilderM env $ runReaderT1 (ListE []) $ runSubstReaderT idSubst $
+  runReaderT1 (ListE []) $ runSubstReaderT idSubst $
     buildLam "ct" LinArrow resultTy' Pure \ct ->
       withAccumulator (sink argTy) \ref ->
         extendSubst (b @> LinRef ref) $
           transposeBlock body (sink $ Var ct)
-transpose _ = error "not a linear function"
 
 -- === transposition monad ===
 
@@ -63,7 +62,7 @@ substNonlin e = do
 
 isLin :: HoistableE e => e i -> TransposeM i o Bool
 isLin e = do
-  substVals <- mapM lookupSubstM $ freeVarsList AtomNameRep e
+  substVals <- mapM lookupSubstM $ freeAtomVarsList e
   return $ flip any substVals \case
     LinTrivial     -> True
     LinRef _       -> True
@@ -123,7 +122,7 @@ substExprIfNonlin expr =
 isLinEff :: EffectRow o -> TransposeM i o Bool
 isLinEff effs@(EffectRow _ Nothing) = do
   regions <- getLinRegions
-  let effRegions = freeVarsList AtomNameRep effs
+  let effRegions = freeAtomVarsList effs
   return $ not $ null $ S.fromList effRegions `S.intersection` S.fromList regions
 isLinEff _ = error "Can't transpose polymorphic effects"
 
@@ -141,7 +140,7 @@ transposeExpr expr ct = case expr of
         lookupSubstM v >>= \case
           RenameNonlin _ -> error "shouldn't happen"
           LinRef ref -> do
-            refProj <- naryIndexRef ref is'
+            refProj <- naryIndexRef ref (toList is')
             emitCTToRef refProj ct
           LinTrivial -> return ()
       ProjectElt idxs v -> do
@@ -149,7 +148,7 @@ transposeExpr expr ct = case expr of
           RenameNonlin _ -> error "an error, probably"
           LinRef ref -> do
             ref' <- getNaryProjRef (toList idxs) ref
-            refProj <- naryIndexRef ref' is'
+            refProj <- naryIndexRef ref' (toList is')
             emitCTToRef refProj ct
           LinTrivial -> return ()
       _ -> error $ "shouldn't occur: " ++ pprint x
@@ -210,6 +209,8 @@ transposeOp op ct = case op of
   VectorIndex  _ _      -> notImplemented
   CastOp       _ _      -> notImplemented
   RecordCons   _ _      -> notImplemented
+  RecordConsDynamic _ _ _ -> notImplemented
+  RecordSplitDynamic _ _  -> notImplemented
   RecordSplit  _ _      -> notImplemented
   VariantLift  _ _      -> notImplemented
   VariantSplit _ _      -> notImplemented
@@ -226,7 +227,6 @@ transposeOp op ct = case op of
   ToOrdinal    _        -> notLinear
   IdxSetSize   _        -> notLinear
   ThrowError   _        -> notLinear
-  FFICall _ _ _         -> notLinear
   DataConTag _          -> notLinear
   ToEnum _ _            -> notLinear
   ThrowException _      -> notLinear
@@ -325,6 +325,7 @@ transposeCon con ct = case con of
   IndexRangeVal _ _ _ _ -> notTangent
   IndexSliceVal _ _ _   -> notTangent
   ParIndexCon _ _       -> notTangent
+  LabelCon _     -> notTangent
   BaseTypeRef _  -> notTangent
   TabRef _       -> notTangent
   ConRef _       -> notTangent

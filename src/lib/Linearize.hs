@@ -157,7 +157,7 @@ isTrivialForAD expr = do
 isActive :: HoistableE e => e o -> PrimalM i o Bool
 isActive e = do
   vs <- (S.fromList . activeVars) <$> getActivePrimals
-  return $ any (`S.member` vs) (freeVarsList AtomNameRep e)
+  return $ any (`S.member` vs) (freeAtomVarsList e)
 
 -- === converision between monadic and reified version of functions ===
 
@@ -208,9 +208,9 @@ rematPrimal subst wrt m = do
   lin
 
 fromPureUnaryTanFunLam :: EnvReader m => Atom n -> m n (Atom n)
-fromPureUnaryTanFunLam atom = liftImmut $ liftSubstEnvReaderM $ go atom
+fromPureUnaryTanFunLam atom = liftSubstEnvReaderM $ go atom
   where
-    go :: Immut o => Atom i -> SubstEnvReaderM AtomSubstVal i o (Atom o)
+    go :: Atom i -> SubstEnvReaderM AtomSubstVal i o (Atom o)
     go = \case
       Lam (LamExpr b@(LamBinder _ _ _ Pure) (AtomicBlock nullaryLam)) ->
         substBinders b \(LamBinder b' ty _ _) -> do
@@ -226,9 +226,9 @@ fromPureUnaryTanFunLam atom = liftImmut $ liftSubstEnvReaderM $ go atom
 
 -- main API entrypoint
 linearize :: EnvReader m => Atom n -> m n (Atom n)
-linearize x = liftImmut do
-  DB env <- getDB
-  return $ runBuilderM env $ runPrimalM idSubst emptyActivePrimals $ linearizeLambda' x
+linearize x = liftBuilder $
+  runPrimalM idSubst emptyActivePrimals $
+    linearizeLambda' x
 
 -- reify the tangent builder as a lambda
 linearizeLambda' :: Atom i -> PrimalM i o (Atom o)
@@ -318,7 +318,7 @@ linearizeExpr expr = case expr of
   App x idxs -> do
     substM x >>= getType >>= \case
       TabTy _ _ ->
-        zipLin (linearizeAtom x) (pureLin $ ListE idxs) `bindLin`
+        zipLin (linearizeAtom x) (pureLin $ ListE $ toList idxs) `bindLin`
          \(PairE x' (ListE idxs')) -> naryApp x' idxs'
       _ -> error "not implemented"
   Op op      -> linearizeOp op
@@ -396,19 +396,18 @@ linearizeOp op = case op of
           _                -> error "Expected at least one side of the CastOp to have a trivial tangent type"
         y <- emitOp $ CastOp t' x
         return $ WithTangent y do xt >> return (sink yt)
-  RecordCons vs r ->
-    zipLin (traverseLin la vs) (la r) `bindLin` \(PairE (ComposeE vs') r') ->
-      emitOp $ RecordCons vs' r'
-  RecordSplit vs r ->
-    zipLin (traverseLin la vs) (la r) `bindLin` \(PairE (ComposeE vs') r') ->
-      emitOp $ RecordSplit vs' r'
+  RecordCons l r ->
+    zipLin (la l) (la r) `bindLin` \(PairE l' r') ->
+      emitOp $ RecordCons l' r'
+  RecordSplit f r ->
+    zipLin (la f) (la r) `bindLin` \(PairE f' r') ->
+      emitOp $ RecordSplit f' r'
   VariantLift ts v ->
     zipLin (traverseLin pureLin ts) (la v) `bindLin`
       \(PairE (ComposeE ts') v') -> emitOp $ VariantLift ts' v'
   VariantSplit ts v ->
     zipLin (traverseLin pureLin ts) (la v) `bindLin`
       \(PairE (ComposeE ts') v') -> emitOp $ VariantSplit ts' v'
-  FFICall _ _ _          -> error $ "Can't differentiate through an FFI call"
   ThrowException _       -> notImplemented
   SumToVariant _         -> notImplemented
   OutputStreamPtr        -> emitZeroT
@@ -498,6 +497,7 @@ linearizePrimCon con = case con of
   IntRangeVal _ _ _     -> emitZeroT
   IndexRangeVal _ _ _ _ -> emitZeroT
   IndexSliceVal _ _ _   -> emitZeroT
+  LabelCon _     -> error "Unexpected label"
   BaseTypeRef _  -> error "Unexpected ref"
   TabRef _       -> error "Unexpected ref"
   ConRef _       -> error "Unexpected ref"

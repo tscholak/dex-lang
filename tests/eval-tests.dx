@@ -561,10 +561,24 @@ def eitherFloor (x:(Int|Float)) : Int = case x of
   x
 > (Right 1.2)
 
+def wbToEither {a b} : Iso {weights:a | biases:b} (a|b) =
+  fwd = \v.  case v of
+    {|weights=x|} -> Left x
+    {|biases=x|}  -> Right x
+  bwd = \v. case v of
+    Left x  -> {|weights=x|}
+    Right x -> {|biases=x|}
+  MkIso {fwd, bwd}
+
+instance {n m} [Ix n, Ix m] Ix {weights:n | biases:m}
+  getSize = \(). size n + size m
+  ordinal = ordinal <<< appIso wbToEither
+  unsafeFromOrdinal = unsafeFromOrdinal _ >>> revIso wbToEither
+
 -- Sum types as flattened index sets!
-def Weights (n:Type) (m:Type) : Type = n=>m=>Float
-def Biases  (n:Type)          : Type = n=>Float
-def Params  (n:Type) (m:Type) : Type = {weights:(n&m) | biases:n}=>Float
+def Weights (n:Type) (m:Type) [Ix n, Ix m] : Type = n=>m=>Float
+def Biases  (n:Type)          [Ix n]       : Type = n=>Float
+def Params  (n:Type) (m:Type) [Ix n, Ix m] : Type = {weights:(n&m) | biases:n}=>Float
 
 w = for i:(Fin 2). for j:(Fin 3). (IToF (ordinal i)) * 3.0 + (IToF (ordinal j))
 b = for j:(Fin 2). neg (IToF (ordinal j) + 1.0)
@@ -851,30 +865,27 @@ def fromLeftFloat (x:(Float | Int)) : Float =
 :p fromLeftFloat $ Left 1.2
 > 1.2
 
--- TODO: revive these tests once we have automatic inlining control
+@noinline
+def f1 (x:Int) : Int = x + 1
 
--- @noinline
--- def f1 (x:Int) : Int = x + 1
+@noinline
+def f2 (x:Int) : Int = f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ x
 
--- @noinline
--- def f2 (x:Int) : Int = f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ f1 $ x
+@noinline
+def f3 (x:Int) : Int = f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ x
 
--- @noinline
--- def f3 (x:Int) : Int = f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ f2 $ x
+@noinline
+def f4 (x:Int) : Int = f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ x
 
--- @noinline
--- def f4 (x:Int) : Int = f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ f3 $ x
+@noinline
+def f5 (x:Int) : Int = f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ x
 
--- @noinline
--- def f5 (x:Int) : Int = f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ f4 $ x
+@noinline
+def f6 (x:Int) : Int = f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ x
 
--- @noinline
--- def f6 (x:Int) : Int = f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ f5 $ x
-
--- -- This will compile extremely slowly if non-inlining is broken
--- :p f6 0
--- > 100000
-
+-- This will compile extremely slowly if non-inlining is broken
+:p f6 0
+> 100000
 
 -- Testing integer powers
 
@@ -957,12 +968,14 @@ interface AssociatedPermutedParams a c
 >
 > Permuted or incomplete explicit type binders are not supported yet.
 
--- checks that mixing non-data values into the results of case expressions don't
--- prevent them from later being used in types.
-:p
-  x = 1 + 1
-  (n, _) = case x > 1 of
-    True  -> (x, \x:Int. x)
-    False -> (x, \x:Int. x)
-  for i:(Fin n). 1.0
-> [1., 1.]
+-- XXX: Disabled because we now compile expressions like these to blocks, which
+-- need a type that makes sense in the top scope. We may revisit that choice.
+-- -- checks that mixing non-data values into the results of case expressions don't
+-- -- prevent them from later being used in types.
+-- :p
+--   x = 1 + 1
+--   (n, _) = case x > 1 of
+--     True  -> (x, \x:Int. x)
+--     False -> (x, \x:Int. x)
+--   for i:(Fin n). 1.0
+-- > [1., 1.]

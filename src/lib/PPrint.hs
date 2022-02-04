@@ -25,6 +25,7 @@ import Data.Aeson hiding (Result, Null, Value, Success)
 import GHC.Exts (Constraint)
 import GHC.Float
 import Data.Foldable (toList)
+import Data.Functor ((<&>))
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
@@ -32,7 +33,9 @@ import Data.Text.Prettyprint.Doc.Render.Text
 import Data.Text.Prettyprint.Doc
 import Data.Text (Text, uncons, unsnoc, unpack)
 import Data.String (fromString)
-import System.Console.ANSI
+import Data.Maybe (isNothing)
+import qualified System.Console.ANSI as ANSI
+import System.Console.ANSI hiding (Color)
 import System.IO.Unsafe
 import qualified System.Environment as E
 import Numeric
@@ -120,7 +123,7 @@ instance PrettyE ann => Pretty (BinderP c ann n l)
 instance Pretty (Expr n) where pretty = prettyFromPrettyPrec
 instance PrettyPrec (Expr n) where
   prettyPrec (Atom x ) = prettyPrec x
-  prettyPrec (App f xs) = atPrec AppPrec $ pApp f <+> spaced xs
+  prettyPrec (App f xs) = atPrec AppPrec $ pApp f <+> spaced (toList xs)
   prettyPrec (Op  op ) = prettyPrec op
   prettyPrec (Hof (For ann (Lam lamExpr))) =
     atPrec LowestPrec $ forStr ann <+> prettyLamHelper lamExpr (PrettyFor ann)
@@ -156,6 +159,17 @@ instance Pretty (Decl n l) where
     -- Let (v:>Pi _)   bound -> p v <+> "=" <+> p bound
     Let b (DeclBinding ann ty rhs) ->
       align $ p ann <+> p (b:>ty) <+> "=" <> (nest 2 $ group $ line <> pLowest rhs)
+
+instance Pretty (NaryLamExpr n) where
+  pretty (NaryLamExpr (NonEmptyNest b bs) _ body) =
+    "\\" <> prettyBinderNest (Nest b bs) <+> "." <> nest 2 (p body)
+
+instance Pretty (NaryPiType n) where
+  pretty (NaryPiType (NonEmptyNest b bs) effs resultTy) =
+    prettyBinderNest (Nest b bs) <+> "->" <+> "{" <> p effs <> "}" <+> p resultTy
+
+instance Pretty (PiBinder n l) where
+  pretty (PiBinder b ty _) = p (b:>ty)
 
 instance Pretty (LamExpr n) where pretty = prettyFromPrettyPrec
 instance PrettyPrec (LamExpr n) where
@@ -195,49 +209,64 @@ instance PrettyPrec (Atom n) where
         atPrec ArgPrec $ align $ group $
           parens $ flatAlt " " "" <> pApp l <> line <> p sym <+> pApp r
       _  -> atPrec LowestPrec $ pAppArg (p name) params
-    LabeledRow items -> prettyExtLabeledItems items (line <> "?") ":"
+    LabeledRow elems -> prettyRecordTyRow elems "?"
     Record items -> prettyLabeledItems items (line' <> ",") " ="
     Variant _ label i value -> prettyVariant ls label value where
       ls = LabeledItems $ case i of
             0 -> M.empty
             _ -> M.singleton label $ NE.fromList $ fmap (const ()) [1..i]
-    RecordTy items -> prettyExtLabeledItems items (line <> "&") ":"
-    VariantTy items -> prettyExtLabeledItems items (line <> "|") ":"
+    RecordTy elems -> prettyRecordTyRow elems "&"
+    VariantTy items -> prettyExtLabeledItems items Nothing (line <> "|") ":"
     ACase e alts _ -> prettyPrecCase "acase" e alts
-    DataConRef _ params args -> atPrec AppPrec $
+    DataConRef _ params args -> atPrec LowestPrec $
       "DataConRef" <+> p params <+> p args
-    BoxedRef ptrsSizes (Abs b body) -> atPrec AppPrec $
+    BoxedRef ptrsSizes (Abs b body) -> atPrec LowestPrec $
       "Box" <+> p b <+> "<-" <+> p ptrsSizes <+> hardline <> "in" <+> p body
     ProjectElt idxs v ->
-      atPrec AppPrec $ "ProjectElt" <+> p idxs <+> p v
+      atPrec LowestPrec $ "ProjectElt" <+> p idxs <+> p v
     DepPairRef l (Abs b r) _ -> atPrec LowestPrec $
       "DepPairRef" <+> p l <+> "as" <+> p b <+> "in" <+> p r
+
+prettyRecordTyRow :: FieldRowElems n -> Doc ann -> DocPrec ann
+prettyRecordTyRow elems separator = do
+  atPrec ArgPrec $ align $ group $ braces $ (prefix <>) $
+    concatWith (surround $ line <> separator <> " ") $ p <$> fromFieldRowElems elems
+    where prefix = case fromFieldRowElems elems of
+                      [] -> separator
+                      [DynFields _] -> separator
+                      _ -> mempty
+
+instance Pretty (FieldRowElem n) where
+  pretty = \case
+    StaticFields items -> concatWith (surround $ line <> "& ") $
+      withLabels items <&> \(l, _, ty) -> p l <> ":" <+> pLowest ty
+    DynField  l ty -> "@" <> p l <> ":" <+> p ty
+    DynFields f    -> "..." <> p f
 
 instance Pretty (DataConRefBinding n l) where pretty = prettyFromPrettyPrec
 instance PrettyPrec (DataConRefBinding n l) where
   prettyPrec (DataConRefBinding b x) = atPrec AppPrec $ p b <+> "<-" <+> p x
 
 prettyExtLabeledItems :: (PrettyPrec a, PrettyPrec b)
-  => ExtLabeledItems a b -> Doc ann -> Doc ann -> DocPrec ann
-prettyExtLabeledItems (Ext (LabeledItems row) rest) separator bindwith =
+  => ExtLabeledItems a b -> Maybe (Doc ann) -> Doc ann -> Doc ann -> DocPrec ann
+prettyExtLabeledItems (Ext (LabeledItems row) rest) prefix separator bindwith =
   atPrec ArgPrec $ align $ group $ innerDoc
   where
     elems = concatMap (\(k, vs) -> map (k,) (toList vs)) (M.toAscList row)
     fmtElem (label, v) = p label <> bindwith <+> pLowest v
     docs = map fmtElem elems
-    final = case rest of
+    suffix = case rest of
       Just v -> separator <> " ..." <> pArg v
-      Nothing -> case length docs of
-        0 -> separator
-        _ -> mempty
+      Nothing -> if length docs == 0 && isNothing prefix then separator else mempty
     innerDoc = "{" <> flatAlt " " ""
+      <> (case prefix of Nothing -> mempty; Just pref -> pref <> separator <> " ")
       <> concatWith (surround (separator <> " ")) docs
-      <> final <> "}"
+      <> suffix <> "}"
 
 prettyLabeledItems :: PrettyPrec a
   => LabeledItems a -> Doc ann -> Doc ann -> DocPrec ann
 prettyLabeledItems items =
-  prettyExtLabeledItems $ Ext items (Nothing :: Maybe ())
+  prettyExtLabeledItems (Ext items (Nothing :: Maybe ())) Nothing
 
 prettyVariant :: PrettyPrec a
   => LabeledItems () -> Label -> a -> DocPrec ann
@@ -309,6 +338,8 @@ instance Pretty (AtomBinding n) where
     MiscBound   t -> p t
     SolverBound b -> p b
     PtrLitBound ty ptr -> p $ PtrLit ty ptr
+    SimpLamBound ty f -> p ty <> hardline <> p f
+    FFIFunBound _ f -> p f
 
 instance Pretty (LamBinding n) where
   pretty (LamBinding arr ty) =
@@ -335,6 +366,8 @@ instance Pretty (Binding s n) where
       "Superclass" <+> pretty idx <+> "of" <+> pretty className
     MethodBinding     className idx _ ->
       "Method" <+> pretty idx <+> "of" <+> pretty className
+    ImpFunBinding f -> pretty f
+    ObjectFileBinding _ -> "<object file>"
 
 instance Pretty (DataDef n) where
   pretty (DataDef name bs cons) =
@@ -348,7 +381,6 @@ instance Pretty (ClassDef n) where
   pretty (ClassDef classSourceName methodNames _) =
     "Class:" <+> pretty classSourceName <+> pretty methodNames
 
-deriving instance (forall c n. Pretty (v c n)) => Pretty (MaterializedSubst v i o)
 deriving instance (forall c n. Pretty (v c n)) => Pretty (RecSubst v o)
 
 instance Pretty (Env n) where
@@ -382,10 +414,10 @@ instance Pretty Output where
                    Nothing        -> "")
     where benchName = case name of "" -> ""
                                    _  -> "\n" <> p name
-  pretty (PassInfo name s) = "===" <+> p name <+> "===" <> hardline <> p s
+  pretty (PassInfo _ s) = p s
   pretty (EvalTime  t _) = "Eval (s):  " <+> p t
   pretty (TotalTime t)   = "Total (s): " <+> p t <+> "  (eval + compile)"
-  pretty (MiscLog s) = "===" <+> p s <+> "==="
+  pretty (MiscLog s) = p s
 
 
 instance Pretty PassName where
@@ -396,36 +428,8 @@ instance Pretty Result where
     where maybeErr = case r of Failure err -> p err
                                Success () -> mempty
 
-instance Pretty (Module n) where pretty = prettyFromPrettyPrec
-instance PrettyPrec (Module n) where
-  prettyPrec (Module variant decls result) = atPrec ArgPrec $
-    "Module" <+> parens (p (show variant)) <> indented body
-    where
-      body = "unevaluated decls:"
-           <>   indented (prettyLines (fromNest decls))
-           <> "evaluated bindings:"
-           <>   indented (p result)
-
-instance Pretty (UModule n) where
-  pretty (UModule decl sm) =
-    "UModule" <> hardline <>
-    p decl    <> hardline <>
-    p sm      <> hardline
-
-instance Pretty SourceUModule where
-  pretty (SourceUModule decl) = p decl
-
-instance Pretty (UVar n) where pretty = prettyFromPrettyPrec
-instance PrettyPrec (UVar n) where
-  prettyPrec uvar = atPrec ArgPrec case uvar of
-    UAtomVar    v -> p v
-    UTyConVar   v -> p v
-    UDataConVar v -> p v
-    UClassVar   v -> p v
-    UMethodVar  v -> p v
-
-instance NameColor c => Pretty (UBinder c n l) where pretty = prettyFromPrettyPrec
-instance NameColor c => PrettyPrec (UBinder c n l) where
+instance Color c => Pretty (UBinder c n l) where pretty = prettyFromPrettyPrec
+instance Color c => PrettyPrec (UBinder c n l) where
   prettyPrec b = atPrec ArgPrec case b of
     UBindSource v -> p v
     UIgnore       -> "_"
@@ -496,10 +500,12 @@ instance PrettyPrec (UExpr' n) where
     UPrimExpr prim -> prettyPrec prim
     UCase e alts -> atPrec LowestPrec $ "case" <+> p e <>
       nest 2 (hardline <> prettyLines alts)
-    URecord items -> prettyExtLabeledItems items (line' <> ",") " ="
-    URecordTy items -> prettyExtLabeledItems items (line <> "&") ":"
+    ULabel name -> atPrec ArgPrec $ "&" <> p name
+    ULabeledRow elems -> atPrec ArgPrec $ prettyUFieldRowElems (line <> "?") ": " elems
+    URecord   elems -> atPrec ArgPrec $ prettyUFieldRowElems (line' <> ",") "=" elems
+    URecordTy elems -> atPrec ArgPrec $ prettyUFieldRowElems (line <> "&") ": " elems
     UVariant labels label value -> prettyVariant labels label value
-    UVariantTy items -> prettyExtLabeledItems items (line <> "|") ":"
+    UVariantTy items -> prettyExtLabeledItems items Nothing (line <> "|") ":"
     UVariantLift labels value -> prettyVariantLift labels value
     UIntLit   v -> atPrec ArgPrec $ p v
     UFloatLit v -> atPrec ArgPrec $ p v
@@ -510,6 +516,13 @@ prettyVariantLift labels value = atPrec ArgPrec $
       "{|" <> left <+> "..." <> pLowest value <+> "|}"
       where left = foldl (<>) mempty $ fmap plabel $ reflectLabels labels
             plabel (l, _) = p l <> "|"
+
+prettyUFieldRowElems :: Doc ann -> Doc ann -> UFieldRowElems n -> Doc ann
+prettyUFieldRowElems separator bindwith elems =
+  braces $ concatWith (surround $ separator <> " ") $ elems <&> \case
+    UStaticField l e -> p l <> bindwith <> p e
+    UDynField    v e -> p v <> bindwith <> p e
+    UDynFields   v   -> "..." <> p v
 
 instance Pretty (UAlt n) where
   pretty (UAlt pat body) = p pat <+> "->" <+> p body
@@ -544,7 +557,7 @@ instance Pretty (UDataDefTrail n) where
 instance Pretty (UPatAnnArrow n l) where
   pretty (UPatAnnArrow b arr) = p b <> ":" <> p arr
 
-instance NameColor c => Pretty (UAnnBinder c n l) where
+instance Color c => Pretty (UAnnBinder c n l) where
   pretty (UAnnBinder b ty) = p b <> ":" <> p ty
 
 instance Pretty (UMethodDef n) where
@@ -557,11 +570,23 @@ instance PrettyPrec (UPat' n l) where
     UPatPair (PairB x y) -> atPrec ArgPrec $ parens $ p x <> ", " <> p y
     UPatUnit UnitB -> atPrec ArgPrec $ "()"
     UPatCon con pats -> atPrec AppPrec $ parens $ p con <+> spaced (fromNest pats)
-    UPatRecord labels _ ->
-      prettyExtLabeledItems labels (line' <> ",") " ="
+    UPatRecord pats -> atPrec ArgPrec $ prettyUFieldRowPat "," "=" pats
     UPatVariant labels label value -> prettyVariant labels label value
     UPatVariantLift labels value -> prettyVariantLift labels value
     UPatTable pats -> atPrec ArgPrec $ p pats
+
+prettyUFieldRowPat :: forall n l ann. Doc ann -> Doc ann -> UFieldRowPat n l -> Doc ann
+prettyUFieldRowPat separator bindwith pat =
+  braces $ concatWith (surround $ separator <> " ") $ go pat
+  where
+    go :: UFieldRowPat n' l' -> [Doc ann]
+    go = \case
+      UEmptyRowPat          -> []
+      URemFieldsPat UIgnore -> ["..."]
+      URemFieldsPat b       -> ["..." <> p b]
+      UDynFieldsPat   v r rest -> ("@..." <> p v <> bindwith <> p r) : go rest
+      UDynFieldPat    v r rest -> ("@" <> p v <> bindwith <> p r) : go rest
+      UStaticFieldPat l r rest -> (p l <> bindwith <> p r) : go rest
 
 spaced :: (Foldable f, Pretty a) => f a -> Doc ann
 spaced xs = hsep $ map p $ toList xs
@@ -578,13 +603,20 @@ instance Pretty (EnvFrag n l) where
     <> "Effects allowed:" <+> p effects
 
 instance Pretty (TopEnvFrag n l) where
-  pretty (TopEnvFrag bindings scs sourceMap) =
+  pretty (TopEnvFrag bindings scs sourceMap cache _) =
        "bindings:"
     <>   indented (p bindings)
     <> "Synth candidats:"
     <>   indented (p scs)
     <> "Source map:"
     <>   indented (p sourceMap)
+    <> "Cache:"
+    <>   indented (p cache)
+    <> "Object files:"
+    <>   indented "<TODO: Pretty instance>"
+
+instance Pretty (Cache n) where
+  pretty (Cache _ _ _) = "<cache>" -- TODO
 
 instance Pretty (SynthCandidates n) where
   pretty scs =
@@ -613,10 +645,10 @@ instance Pretty IFunType where
     "Fun" <+> p cc <+> p argTys <+> "->" <+> p retTys
 
 instance Pretty (ImpFunction n) where
-  pretty (ImpFunction f (IFunType cc _ _) (Abs bs body)) =
-    "def" <+> p f <+> p cc <+> p bs
+  pretty (ImpFunction (IFunType cc _ _) (Abs bs body)) =
+    "impfun" <+> p cc <+> prettyBinderNest bs
     <> nest 2 (hardline <> p body) <> hardline
-  pretty (FFIFunction f) = p f
+  pretty (FFIFunction _ f) = p f
 
 instance Pretty (ImpBlock n)  where
   pretty (ImpBlock Empty expr) = group $ line <> pLowest expr
@@ -646,9 +678,6 @@ instance Pretty (ImpInstr n)  where
   pretty ISyncWorkgroup   = "syncWorkgroup"
   pretty IThrowError      = "throwError"
   pretty (ICall f args)   = "call" <+> p f <+> p args
-
-instance Pretty (ImpModule n) where
-  pretty (ImpModule fs) = "Imp module" <> indented (prettyLines fs)
 
 instance Pretty BaseType where pretty = prettyFromPrettyPrec
 instance PrettyPrec BaseType where
@@ -706,6 +735,7 @@ instance PrettyPrec e => PrettyPrec (PrimTC e) where
     TypeKind -> atPrec ArgPrec "Type"
     EffectRowKind -> atPrec ArgPrec "EffKind"
     LabeledRowKindTC -> atPrec ArgPrec "Fields"
+    LabelType -> atPrec ArgPrec "Label"
     _ -> prettyExprDefault $ TCExpr con
 
 instance PrettyPrec e => Pretty (PrimCon e) where pretty = prettyFromPrettyPrec
@@ -732,6 +762,7 @@ prettyPrecPrimCon con = case con of
   TabRef tab -> atPrec ArgPrec $ "Ref" <+> pApp tab
   ConRef conRef -> atPrec AppPrec $ "Ref" <+> pApp conRef
   RecordRef _ -> atPrec ArgPrec "Record ref"  -- TODO
+  LabelCon name -> atPrec ArgPrec $ "##" <> p name
 
 
 instance PrettyPrec e => Pretty (PrimOp e) where pretty = prettyFromPrettyPrec
@@ -741,16 +772,17 @@ instance PrettyPrec e => PrettyPrec (PrimOp e) where
     PrimEffect ref (MExtend _   x ) -> atPrec LowestPrec $ "extend" <+> pApp ref <+> pApp x
     PtrOffset ptr idx -> atPrec LowestPrec $ pApp ptr <+> "+>" <+> pApp idx
     PtrLoad   ptr     -> atPrec AppPrec $ pAppArg "load" [ptr]
-    RecordCons items rest ->
-      prettyExtLabeledItems (Ext items $ Just rest) (line' <> ",") " ="
-    RecordSplit types val -> atPrec AppPrec $
-      "RecordSplit" <+> prettyLabeledItems types (line <> "&") ":" ArgPrec
-                    <+> pArg val
+    RecordCons items rest -> atPrec LowestPrec $ "RecordCons" <+> pArg items <+> pArg rest
+    RecordConsDynamic lab val rec -> atPrec LowestPrec $
+      "RecordConsDynamic" <+> pArg lab <+> pArg val <+> pArg rec
+    RecordSplit fields val -> atPrec AppPrec $
+      "RecordSplit" <+> pArg fields <+> pArg val
     VariantLift types val ->
       prettyVariantLift (fmap (const ()) types) val
     VariantSplit types val -> atPrec AppPrec $
       "VariantSplit" <+> prettyLabeledItems types (line <> "|") ":" ArgPrec
                      <+> pArg val
+    SynthesizeDict _ e -> atPrec LowestPrec $ "synthesize" <+> pApp e
     _ -> prettyExprDefault $ OpExpr op
 
 prettyExprDefault :: PrettyPrec e => PrimExpr e -> DocPrec ann
@@ -819,7 +851,7 @@ addPrefix prefix str = unlines $ map prefixLine $ lines str
         prefixLine s = case s of "" -> prefix
                                  _  -> prefix ++ " " ++ s
 
-addColor :: Bool -> Color -> String -> String
+addColor :: Bool -> ANSI.Color -> String -> String
 addColor False _ s = s
 addColor True c s =
   setSGRCode [SetConsoleIntensity BoldIntensity, SetColor Foreground Vivid c]

@@ -12,6 +12,8 @@ module GenericTraversal
   (GenericTraverser (..), GenericallyTraversableE (..),
    traverseExprDefault, traverseAtomDefault) where
 
+import Control.Monad
+
 import Name
 import Builder
 import Syntax
@@ -26,19 +28,19 @@ class (ScopableBuilder2 m, SubstReader Name m)
   traverseExpr :: Emits o => Expr i -> m i o (Expr o)
   traverseExpr = traverseExprDefault
 
-  traverseAtom :: Immut o => Atom i -> m i o (Atom o)
+  traverseAtom :: Atom i -> m i o (Atom o)
   traverseAtom = traverseAtomDefault
 
 traverseExprDefault :: Emits o => GenericTraverser m => Expr i -> m i o (Expr o)
-traverseExprDefault expr = liftImmut $ case expr of
-  App g xs -> App  <$> tge g <*> mapM tge xs
+traverseExprDefault expr = case expr of
+  App g xs -> App <$> tge g <*> mapM tge xs
   Atom x  -> Atom <$> tge x
   Op  op  -> Op   <$> mapM tge op
   Hof hof -> Hof  <$> mapM tge hof
   Case scrut alts resultTy effs ->
     Case <$> tge scrut <*> mapM traverseAlt alts <*> tge resultTy <*> substM effs
 
-traverseAtomDefault :: Immut o => GenericTraverser m => Atom i -> m i o (Atom o)
+traverseAtomDefault :: GenericTraverser m => Atom i -> m i o (Atom o)
 traverseAtomDefault atom = case atom of
   Var v -> Var <$> substM v
   Lam (LamExpr (LamBinder b ty arr eff) body) -> do
@@ -64,15 +66,9 @@ traverseAtomDefault atom = case atom of
       mapM tge params <*> pure con <*> mapM tge args
   TypeCon sn dataDefName params ->
     TypeCon sn <$> substM dataDefName <*> mapM tge params
-  LabeledRow (Ext items rest) -> do
-    items' <- mapM tge items
-    rest'  <- mapM substM rest
-    return $ LabeledRow $ Ext items' rest'
+  LabeledRow elems -> LabeledRow <$> traverseGenericE elems
   Record items -> Record <$> mapM tge items
-  RecordTy (Ext items rest) -> do
-    items' <- mapM tge items
-    rest'  <- mapM substM rest
-    return $ RecordTy $ Ext items' rest'
+  RecordTy elems -> RecordTy <$> traverseGenericE elems
   Variant (Ext types rest) label i value -> do
     types' <- mapM tge types
     rest'  <- mapM substM rest
@@ -85,31 +81,33 @@ traverseAtomDefault atom = case atom of
   ProjectElt _ _ -> substM atom
   _ -> error $ "not implemented: " ++ pprint atom
 
-tge :: (Immut o, GenericallyTraversableE e, GenericTraverser m)
+tge :: (GenericallyTraversableE e, GenericTraverser m)
     => e i -> m i o (e o)
 tge = traverseGenericE
 
 class GenericallyTraversableE (e::E) where
-  traverseGenericE :: Immut o => GenericTraverser m => e i -> m i o (e o)
+  traverseGenericE :: GenericTraverser m => e i -> m i o (e o)
 
 instance GenericallyTraversableE Atom where
   traverseGenericE = traverseAtom
 
-instance GenericallyTraversableE Module where
-  traverseGenericE (Module ir decls result) = do
-    DistinctAbs decls' result' <- buildScoped $
-      traverseDeclNest decls $ substM result
-    return $ Module ir decls' result'
-
 instance GenericallyTraversableE Block where
   traverseGenericE (Block _ decls result) = do
-    DistinctAbs decls' (PairE ty result') <-
+    Abs decls' (PairE ty result') <-
       buildScoped $ traverseDeclNest decls do
         result' <- traverseExpr result
         resultTy <- getType result'
         return $ PairE resultTy result'
     ty' <- liftHoistExcept $ hoist decls' ty
     return $ Block (BlockAnn ty') decls' result'
+
+instance GenericallyTraversableE FieldRowElems where
+  traverseGenericE elems = do
+    els' <- fromFieldRowElems <$> substM elems
+    dropSubst $ fieldRowElemsFromList <$> forM els' \case
+      StaticFields items  -> StaticFields <$> mapM tge items
+      DynField  labVar ty -> DynField labVar <$> tge ty
+      DynFields rowVar    -> return $ DynFields rowVar
 
 traverseDeclNest
   :: (GenericTraverser m, Emits o)
@@ -123,7 +121,7 @@ traverseDeclNest (Nest (Let b (DeclBinding ann _ expr)) rest) cont = do
   extendSubst (b @> v) $ traverseDeclNest rest cont
 
 traverseAlt
-  :: (Immut o, GenericTraverser m)
+  :: GenericTraverser m
   => Alt i
   -> m i o (Alt o)
 traverseAlt (Abs Empty body) = Abs Empty <$> tge body

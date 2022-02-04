@@ -16,12 +16,13 @@ module Util (IsBool (..), group, ungroup, pad, padLeft, delIdx, replaceIdx,
              measureSeconds,
              bindM2, foldMapM, lookupWithIdx, (...), zipWithT, for,
              Zippable (..), zipWithZ_, zipErr, forMZipped, forMZipped_,
-             iota, whenM) where
+             iota, whenM, unsnoc, anyM) where
 
 import Data.Functor.Identity (Identity(..))
 import Data.List (sort)
 import qualified Data.List.NonEmpty as NE
 import Data.Foldable
+import Data.List.NonEmpty (NonEmpty (..))
 import Prelude
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as M
@@ -46,6 +47,11 @@ onFst f (x, y) = (f x, y)
 
 onSnd :: (a -> b) -> (c, a) -> (c, b)
 onSnd f (x, y) = (x, f y)
+
+unsnoc :: NonEmpty a -> ([a], a)
+unsnoc (x:|xs) = case reverse (x:xs) of
+  (y:ys) -> (reverse ys, y)
+  _ -> error "impossible"
 
 enumerate :: Traversable f => f a -> f (Int, a)
 enumerate xs = evalState (traverse addCount xs) 0
@@ -159,8 +165,7 @@ findReplace old new s@(x:xs) =
 scan :: Traversable t => (a -> s -> (b, s)) -> t a -> s -> (t b, s)
 scan f xs s = runState (traverse (asState . f) xs) s
 
-scanM :: (Monad m, Traversable t)
-  => (a -> s -> m (b, s)) -> t a -> s -> m (t b, s)
+scanM :: (Monad m, Traversable t) => (a -> s -> m (b, s)) -> t a -> s -> m (t b, s)
 scanM f xs s = runStateT (traverse (asStateT . f) xs) s
 
 asStateT :: Monad m => (s -> m (a, s)) -> StateT s m a
@@ -232,6 +237,11 @@ whenM :: Monad m => m Bool -> m () -> m ()
 whenM test doit = test >>= \case
   True -> doit
   False -> return ()
+
+anyM :: Monad m => (a -> m Bool) -> [a] -> m Bool
+anyM f xs = do
+  conds <- mapM f xs
+  return $ any id conds
 
 -- === zippable class ===
 
