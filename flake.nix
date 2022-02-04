@@ -26,14 +26,14 @@
         overlays = [
           haskellNix.overlay
           (final: prev: {
-            llvm-config = prev.llvmPackages_9.llvm;
+            llvm-config = prev.llvmPackages_11.llvm;
             dexProject =
               final.haskell-nix.cabalProject' {
                 src = final.haskell-nix.haskellLib.cleanGit {
                   name = "dex";
                   src = ./.;
                 };
-                compiler-nix-name = "ghc884";
+                compiler-nix-name = "ghc8107";
                 shell.tools = {
                   cabal = {};
                   hlint = {};
@@ -53,19 +53,19 @@
             inherit (haskellNix) config;
             overlays = [
               (final: prev: {
-                pkgsLLVM9 = nixpkgsFun {
+                pkgsLLVM11 = nixpkgsFun {
                   inherit system;
                   inherit (haskellNix) config;
                   overlays = [
                     (final': prev': {
-                      stdenv = prev.llvmPackages_9.stdenv;
+                      stdenv = prev.llvmPackages_11.stdenv;
                     })
                   ] ++ overlays;
                 };
               })
             ] ++ overlays;
           };
-        flake = pkgs.pkgsLLVM9.dexProject.flake {};
+        flake = pkgs.pkgsLLVM11.dexProject.flake {};
       in flake // {
         defaultPackage = flake.packages."dex:exe:dex";
       });
