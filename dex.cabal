@@ -14,9 +14,7 @@ license-file:        LICENSE
 build-type:          Simple
 
 data-files:          lib/*.dx, static/*.html, static/*.js, static/*.css
-extra-source-files:  lib/*.dx,
-                     src/lib/dexrt.bc,
-                     static/index.js, static/style.css
+extra-source-files:  lib/*.dx, static/index.js, static/style.css
 
 flag cuda
   description:         Enables building with CUDA support
@@ -42,10 +40,20 @@ flag debug
   description:         Enable extra checks and stack trace printing (useful for developers)
   default:             False
 
+library dexrt
+  cxx-sources:         src/lib/dexrt.cpp
+  cxx-options:         -fPIC -std=c++11 -fno-exceptions -fno-rtti -c -emit-llvm -o src/lib/dexrt.bc
+  if flag(live)
+    extra-libraries:   libpng
+    cxx-options:       -DDEX_LIVE
+  if flag(cuda)
+    extra-libraries:   cuda
+    cxx-options:       -DDEX_CUDA
+
 library dex-resources
   if os(darwin)
     exposed-modules:   Resources
-  build-depends:       base, bytestring, file-embed
+  build-depends:       base, bytestring, file-embed, dexrt
   hs-source-dirs:      src/resources
   default-language:    Haskell2010
   default-extensions:  CPP
@@ -81,15 +89,13 @@ library
   if !os(darwin)
     exposed-modules:   Resources
     hs-source-dirs:    src/resources
-    build-depends:     file-embed
+    build-depends:     file-embed, dexrt
   else
     build-depends:     dex-resources
   default-language:    Haskell2010
   hs-source-dirs:      src/lib
   ghc-options:         -Wall -fPIC -optP-Wno-nonportable-include-path
                        -Wno-unticked-promoted-constructors
-  cxx-sources:         src/lib/dexrt.cpp
-  cxx-options:         -std=c++11 -fPIC
   default-extensions:  CPP, DeriveTraversable, TypeApplications, OverloadedStrings,
                        TupleSections, ScopedTypeVariables, LambdaCase, PatternSynonyms,
                        BlockArguments, GADTs, TypeOperators, DataKinds, KindSignatures
